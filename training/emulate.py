@@ -46,7 +46,8 @@ FILM_FPS, VIDEO_FPS = 18, 25
 def draw_geometry(rng):
     global OVER, LINE, P, PIC_H
     OVER = int(rng.integers(-60, 30))       # negative: the scanner crops the frame line out of normal frames
-    LINE = int(rng.integers(18, 46))
+    # some films have a thin frame line, which shows only as a seam when the film slips
+    LINE = int(rng.integers(3, 11)) if rng.random() < 0.3 else int(rng.integers(18, 46))
     P = H - OVER
     PIC_H = P - LINE
 
@@ -161,7 +162,9 @@ class Film:
         s.scratch = None
         # frame line: tone, possible colour cast and soft edges
         s.line_tone = rng.uniform(3, 45) * (1 + rng.normal(0, 0.15, 3)).clip(0.6, 1.4)
-        s.line_softness = int(rng.integers(2, 11))
+        # a light frame line (only a little darker than the picture) is nearly invisible
+        s.line_light = rng.uniform(0.55, 0.9) if rng.random() < 0.3 else None
+        s.line_softness = min(int(rng.integers(2, 11)), max(1, LINE // 2))
         # perforation hole
         s.hole = None
         if rng.random() < 0.35:
@@ -194,7 +197,10 @@ class Film:
                 s.scratch = None
         fr = np.zeros((P, W, 3), np.float32)
         fr[:PIC_H] = x
-        fr[PIC_H:] = s.line_tone * rng.uniform(0.85, 1.15)                  # dark frame line
+        if s.line_light:                                                    # light frame line
+            fr[PIC_H:] = x[-8:].mean((0, 1)) * s.line_light
+        else:                                                               # dark frame line
+            fr[PIC_H:] = s.line_tone * rng.uniform(0.85, 1.15)
         if s.line_softness:                                                 # the frame-line edges blend into the picture
             for bottom in (PIC_H, P):
                 a, b = bottom - s.line_softness, bottom + s.line_softness
@@ -232,7 +238,7 @@ def slips(n, rng):
             v = rng.uniform(15, 120) * rng.choice([-1, 1])
             s[t:b] = (np.arange(b - t) * v) % P
         else:
-            s[t:b] = rng.choice([rng.uniform(15, 50), P - rng.uniform(15, 50)])
+            s[t:b] = rng.choice([rng.uniform(15, 110), P - rng.uniform(15, 110)])   # also close to the edge
         kind[t:b] = k
         t = b + int(rng.uniform(4, 12) * VIDEO_FPS)
     return s, kind

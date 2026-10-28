@@ -29,7 +29,7 @@ Super8Fixer.exe repair sources\film.mp4 --analyze-only --no-model
 
 ```
 for /L %s in (1,1,12) do python emulate.py --videos sources -o emu\e%s --duration 90 --seed %s --no-reference
-python train_emulated.py emu\e1 emu\e2 ... emu\e12 --negatives sources -o slip_classifier.pt --steps 4000
+python train_emulated.py emu\e1 emu\e2 ... emu\e12 --negatives sources -o slip_classifier.pt --steps 5000
 python export_onnx.py slip_classifier.pt ..\Super8Fixer\models
 ```
 
@@ -38,7 +38,7 @@ model tends to learn the look of the emulator and raises false alarms in busy sc
 sources out of training to measure the false alarms on them.
 
 The model outputs a per-frame probability; the application averages it over up to 12 frames of a
-run. `slip_classifier.json` next to the model (`{"operating_point": 0.15}`) tells the application
+run. `slip_classifier.json` next to the model (`{"operating_point": 0.3}`) tells the application
 which mean probability counts as 0.5; `export_onnx.py` copies it next to the ONNX file.
 
 Use only sources that you may use (for example public-domain films); the model learns from them.

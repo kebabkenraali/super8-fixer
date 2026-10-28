@@ -12,7 +12,7 @@ pub const AH: usize = 540; // analysis height (rows)
 pub const AW: usize = 64; // analysis width
 pub const EDGE: i32 = 20; // a frame line this close to the edge = normal frame
 const MERGE_GAP: usize = 3; // a normal gap this short between two runs belongs to the run
-pub const MODEL_ZONE: f64 = 0.12; // the classifier decides runs whose frame line is at 12-88 % height
+pub const MODEL_ZONE: f64 = 0.05; // the classifier decides runs whose frame line is at 5-95 % height
 
 /// Mean over the window [y-r, y+r] per column, edges replicated.
 fn box_mean(a: &[f32], h: usize, w: usize, r: usize) -> Vec<f32> {

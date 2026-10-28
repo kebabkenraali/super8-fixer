@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import slip_model as SM  # noqa: E402
 from common import find_ffmpeg, video_info  # noqa: E402
 
-EDGE_PX = 50          # a slip counts as real when the frame line is at least this far from the edges (1080 picture)
+EDGE_PX = 30          # a slip counts as real when the frame line is at least this far from the edges (1080 picture)
 
 
 def load_truth(name):

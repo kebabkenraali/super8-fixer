@@ -7,7 +7,7 @@ File: `models/slip_classifier.onnx` (about 0.8 MB). License: CC BY-NC 4.0.
 Given a downscaled video frame (144 x 96 RGB), the model outputs the probability that a film frame
 line is visible inside the picture (a frame-line slip) rather than a straight horizontal edge that
 belongs to the picture (a horizon, a window frame, the edge of a table or pavement). Super8 Fixer
-uses it to decide runs whose frame line is between 12 % and 88 % of the picture height; runs near the
+uses it to decide runs whose frame line is between 5 % and 95 % of the picture height; runs nearer the
 edges are decided by the tracker's confidence value.
 
 Architecture: five 3x3 convolution layers (32-128 channels) with batch normalization and max
@@ -52,16 +52,17 @@ for the emulated training videos:
 The emulator draws for every training video its own film and scanner: frame-line thickness, tone
 and softness, perforation hole, scan window over-height (frame line visible or cropped), exposure,
 grain, vignette, sharpness and compression, and inserts slips of three kinds (slides, rolls, small
-constant offsets) and gate weave. 24 videos of 90 s each were used: seeds 1-12 from the public-domain
-films and seeds 13-24 from the CC BY home movies. Places where the
+constant offsets, also close to the picture edge) and gate weave. Some films get a thin (3-10 px) or a
+light frame line, which shows only as a seam when the film slips. 48 videos of 90 s each were used:
+seeds 1-12 and 25-36 from the public-domain films, seeds 13-24 and 37-48 from the CC BY home movies. Places where the
 tracker alone raised false alarms in the source films (horizons, sign edges) were sampled more often
 as hard negative examples, and artificial brightness steps without a frame line were added as
 negatives. Original, unprocessed frames of 14 of the 16 source films (400 per film) were used as
 negatives too, so that the model does not learn the look of the emulator; Paradeof1941 and
-HomeMoviesCan11283 were held out for evaluation. 4000 training steps of 128 examples.
+HomeMoviesCan11283 were held out for evaluation. 5000 training steps of 128 examples.
 
-`models/slip_classifier.json` sets the operating point 0.15: Super8Fixer.exe calibrates the mean
-probability of a run so that 0.15 becomes 0.5, the default classifier threshold.
+`models/slip_classifier.json` sets the operating point 0.3: Super8Fixer.exe calibrates the mean
+probability of a run so that 0.3 becomes 0.5, the default classifier threshold.
 
 ## Evaluation
 
@@ -70,11 +71,12 @@ default settings:
 
 | film | length | runs repaired | frames repaired |
 |---|---|---|---|
-| Paradeof1941 | 9.5 min | 6 | 210 |
+| Paradeof1941 | 9.5 min | 4 | 70 |
 | HomeMoviesCan11283 | 12.7 min | 5 | 395 |
 
 In a private home-movie transfer with known real slips (not used for training) all 10 known slip
-runs were detected and 6 of 8 known false-alarm runs rejected.
+runs were detected and 7 of 10 known false-alarm runs rejected; a slip with the frame line at 6 % of
+the height, which the previous model missed, is now detected.
 
 No private home movies were used for training, and the model contains no images.
 
