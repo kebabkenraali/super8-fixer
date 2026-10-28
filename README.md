@@ -1,8 +1,8 @@
 # Super8 Fixer
 
 Repairs **frame-line slips** (framing errors) in digitized Super 8, 8 mm and other small-gauge film,
-and **stabilizes** the picture. A native Windows application with a graphical interface and a command
-line. Everything runs on your own computer.
+**removes dust and dirt** and **restores faded colours**. A native Windows application with a graphical
+interface and a command line. Everything runs on your own computer.
 
 When film slips in the scanner gate, the frame line (the dark gap between two film frames) slides
 into the picture: the top of the video frame shows the bottom of one film frame and the bottom shows
@@ -11,7 +11,7 @@ and rebuilds the missing part from the neighbouring frames, so that the seam doe
 
 ![Super8 Fixer: a slipped frame before and after the repair](assets/screenshot.png)
 
-*The run table, a slipped frame before and after the repair, and the run editor. The video is an emulated slip made from a Prelinger Archives home movie (CC BY 3.0).*
+*The run table, a slipped frame before and after the repair (with dust removal and colour restoration), and the run editor. The video is an emulated slip made from a Prelinger Archives home movie (CC BY 3.0).*
 
 Made with Claude AI
 
@@ -31,10 +31,16 @@ Made with Claude AI
   - nudge the filled part vertically and horizontally.
 
   Edits are saved next to the video (`VIDEO.s8edits.json`) and reapplied after a new analysis.
-- **Stabilization**: removes gate weave and hand-held shake while keeping intentional camera moves.
-  Global motion is measured by block matching on an image pyramid (median over blocks). Scene cuts
-  and the duplicate frames of 18 fps film transferred to 25 fps video are detected, and the
-  camera path is smoothed over real film frames only.
+- **Dust and dirt removal**: spots that are in one film frame only (dust, hairs, dirt, small
+  scratches) are replaced from the aligned previous and next film frames. Only small spots are
+  touched, so moving objects stay. The duplicate frames of 18 fps film transferred to 25 fps video are
+  recognised, so a spot repeated in two video frames is still found.
+- **Colour restoration**: every colour channel is stretched between its darkest and brightest values,
+  which removes the cast of faded film and restores contrast; the levels are smoothed over each scene so
+  that the picture does not flicker. *Natural* stays close to the original, *Vivid* adds contrast and
+  saturation.
+- **Side-by-side clip**: a 10-second clip with the original on the left and the result on the right,
+  for checking or showing the repair.
 - **Learns from your corrections** (optional): `training/finetune_from_edits.py` fine-tunes the slip
   classifier with the runs you accepted or rejected. The personal model stays on your computer.
 
@@ -56,26 +62,25 @@ Requirements: Windows 10 or 11 (64-bit). A DirectX 12 GPU speeds up the classifi
 2. Check the run table. Selecting a run shows a frame before and after the repair; the slider and the
    arrow keys step through the frames of the run, Page Up / Page Down move between runs. The *Repair*
    tick decides whether the run is repaired. Correct runs in the run editor when needed.
-3. Press **2. Repair and stabilize**. The results are written next to the video:
+3. Choose the picture settings (dust removal, colours); the preview shows their effect.
+   **Side-by-side clip** writes a 10-second comparison around the current frame.
+4. Press **2. Repair**. The results are written next to the video:
 
    | file | content |
    |---|---|
-   | `video_repaired.mp4` | frame-line slips repaired |
-   | `video_repaired_stable.mp4` | also stabilized |
+   | `video_repaired.mp4` | slips repaired, dust removed, colours restored |
+   | `video_compare_MMmSSs.mp4` | side-by-side clips |
    | `video_repair_report.txt` | runs, confidence values and actions |
    | `video.s8edits.json` | your manual edits |
 
-   Audio is copied from the original as it is. `video.s8analysis.bin` and `video.s8motion.bin` are
-   caches that make a new run on the same video fast; they can be deleted.
-
-**Stabilize only** stabilizes the chosen video without slip repair (`video_stable.mp4`).
+   Audio is copied from the original as it is. `video.s8analysis.bin` is a cache that makes a new
+   analysis of the same video fast; it can be deleted.
 
 ## Command line
 
 ```
-Super8Fixer.exe repair VIDEO [options]       repair frame-line slips -> VIDEO_repaired.mp4
-Super8Fixer.exe stabilize VIDEO [options]    stabilize -> VIDEO_stable.mp4
-Super8Fixer.exe all VIDEO [options]          both -> VIDEO_repaired_stable.mp4
+Super8Fixer.exe repair VIDEO [options]       repair, remove dust, restore colours -> VIDEO_repaired.mp4
+Super8Fixer.exe compare VIDEO --at 05:10     10 s side by side -> VIDEO_compare_05m10s.mp4
 Super8Fixer.exe help                         all options
 ```
 
@@ -84,7 +89,8 @@ Examples:
 ```
 Super8Fixer.exe repair film.mp4 --analyze-only
 Super8Fixer.exe repair film.mp4 --skip 03:37-03:44 --force 10:56-10:58
-Super8Fixer.exe all film.mp4 --smoothing 10
+Super8Fixer.exe repair film.mp4 --colour vivid --dust-strength 1.5
+Super8Fixer.exe compare film.mp4 --at 10:56
 ```
 
 ## Building from source

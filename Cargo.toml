@@ -1,8 +1,8 @@
 [package]
 name = "super8-fixer"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
-description = "Repairs frame-line slips (framing errors) in digitized Super 8 / 8 mm film and stabilizes the picture"
+description = "Repairs frame-line slips (framing errors) in digitized Super 8 / 8 mm film, removes dust and restores colours"
 license-file = "LICENSE.md"
 publish = false
 

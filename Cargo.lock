@@ -3379,7 +3379,7 @@ checksum = "6637bab7722d379c8b41ba849228d680cc12d0a45ba1fa2b48f2a30577a06731"
 
 [[package]]
 name = "super8-fixer"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "eframe",

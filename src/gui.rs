@@ -1,6 +1,6 @@
 //! The window (egui): video, settings, run table with repair decisions, run editor for manual
-//! corrections, before/after preview, repair and stabilization in a background thread, progress
-//! and log.
+//! corrections, before/after preview, picture enhancement settings, repair and side-by-side clips in
+//! a background thread, progress and log.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::assemble::Fill;
 use crate::repair::{self, Analysis, Preview, RepairSettings};
-use crate::stabilize::StabilizeSettings;
+use crate::enhance::{Colour, EnhanceSettings};
 use crate::video::timestamp;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -25,10 +25,9 @@ struct Settings {
     model_threshold: f32,
     assemble: bool,
     refine: bool,
-    stabilize: bool,
-    smoothing: f64,
-    max_shift: f64,
-    scene_threshold: f64,
+    dust: bool,
+    dust_strength: f32,
+    colour: Colour,
     crf: u32,
     preset: String,
     gpu: bool,
@@ -38,7 +37,7 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         let r = RepairSettings::default();
-        let s = StabilizeSettings::default();
+        let e = EnhanceSettings::default();
         Settings {
             video: String::new(),
             threshold: r.threshold,
@@ -46,10 +45,9 @@ impl Default for Settings {
             model_threshold: r.model_threshold,
             assemble: r.assemble,
             refine: r.refine,
-            stabilize: true,
-            smoothing: s.smoothing,
-            max_shift: s.max_shift,
-            scene_threshold: s.scene_threshold,
+            dust: e.dust,
+            dust_strength: e.dust_strength,
+            colour: e.colour,
             crf: r.crf,
             preset: r.preset,
             gpu: true,
@@ -80,18 +78,10 @@ impl Settings {
             force: vec![],
             assemble: self.assemble,
             refine: self.refine,
+            enhance: EnhanceSettings { dust: self.dust, dust_strength: self.dust_strength, colour: self.colour },
             crf: self.crf,
             preset: self.preset.clone(),
             gpu: self.gpu,
-        }
-    }
-    fn stabilize(&self) -> StabilizeSettings {
-        StabilizeSettings {
-            smoothing: self.smoothing,
-            max_shift: self.max_shift,
-            scene_threshold: self.scene_threshold,
-            crf: self.crf,
-            preset: self.preset.clone(),
         }
     }
 }
@@ -236,8 +226,6 @@ impl App {
     fn repair(&mut self) {
         let Some(an) = self.analysis.clone() else { return };
         let a = self.s.repair();
-        let sa = self.s.stabilize();
-        let stabilize = self.s.stabilize;
         let stem = repair::stem(&an.info.path);
         let video = an.info.path.clone();
         let _ = crate::analysis::report(Path::new(&repair::with_suffix(&stem, "_repair_report.txt")), &an.runs, an.info.fps);
@@ -246,26 +234,18 @@ impl App {
         self.start_job(move || {
             let o = repair::with_suffix(&stem, "_repaired.mp4");
             repair::render(&an, &a, &o)?;
-            if !stabilize {
-                return Ok(JobResult::Done(o));
-            }
-            let v = crate::video::VideoInfo::read(&o)?;
-            let st = repair::with_suffix(&repair::stem(&o), "_stable.mp4");
-            crate::stabilize::stabilize(&v, &sa, Some(&st))?;
-            Ok(JobResult::Done(st))
+            Ok(JobResult::Done(o))
         });
     }
 
-    fn stabilize_only(&mut self) {
-        let video = self.s.video.clone();
-        let sa = self.s.stabilize();
-        crate::log(&format!("- Stabilization: {video}"));
-        self.start_job(move || {
-            let v = crate::video::VideoInfo::read(&video)?;
-            let st = repair::with_suffix(&repair::stem(&video), "_stable.mp4");
-            crate::stabilize::stabilize(&v, &sa, Some(&st))?;
-            Ok(JobResult::Done(st))
-        });
+    /// A 10-second clip around the current frame: original and result side by side.
+    fn compare_clip(&mut self) {
+        let Some(an) = self.analysis.clone() else { return };
+        let a = self.s.repair();
+        let frame = self.frame;
+        let _ = an.save_edits();
+        crate::log(&format!("- Side-by-side clip at {}", timestamp(frame, an.info.fps)));
+        self.start_job(move || Ok(JobResult::Done(repair::compare_clip(&an, &a, frame, 10.0)?)));
     }
 
     fn request_preview(&mut self, frame: usize) {
@@ -275,10 +255,10 @@ impl App {
             return;
         }
         let an = an.clone();
-        let assemble = self.s.assemble;
+        let a = self.s.repair();
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let _ = tx.send(repair::preview(&an, frame, assemble).map_err(|e| format!("{e:#}")));
+            let _ = tx.send(repair::preview(&an, frame, &a).map_err(|e| format!("{e:#}")));
         });
         self.preview_job = Some((frame, rx));
     }
@@ -375,23 +355,32 @@ impl App {
                 .on_hover_text("Checks every repaired frame against the previous one and corrects the seam position when the tracker locked onto an edge in the picture. Takes effect on the next analysis.");
         });
         ui.separator();
-        ui.heading("Stabilization");
+        ui.heading("Picture");
+        let before = (self.s.dust, self.s.dust_strength, self.s.colour);
         ui.add_enabled_ui(!busy, |ui| {
-            ui.checkbox(&mut self.s.stabilize, "Stabilize after repairing");
-            ui.horizontal(|ui| {
-                ui.label("Smoothing");
-                ui.add(egui::DragValue::new(&mut self.s.smoothing).range(1.0..=40.0).speed(0.2).suffix(" frames"))
-                    .on_hover_text("Larger = steadier, but slow camera moves are damped too");
+            ui.checkbox(&mut self.s.dust, "Remove dust and dirt")
+                .on_hover_text("Removes spots that are in one film frame only (dust, hairs, dirt). Moving objects are left alone.");
+            ui.add_enabled_ui(self.s.dust, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Sensitivity");
+                    ui.add(egui::Slider::new(&mut self.s.dust_strength, 0.5..=2.0).step_by(0.1))
+                        .on_hover_text("Higher also removes faint spots, lower only clear ones");
+                });
             });
             ui.horizontal(|ui| {
-                ui.label("Max shift");
-                ui.add(egui::DragValue::new(&mut self.s.max_shift).range(0.5..=10.0).speed(0.1).suffix(" %"));
-            });
-            ui.horizontal(|ui| {
-                ui.label("Scene threshold");
-                ui.add(egui::DragValue::new(&mut self.s.scene_threshold).range(5.0..=100.0).speed(0.5));
+                ui.label("Colours");
+                egui::ComboBox::from_id_salt("colour").selected_text(self.s.colour.label()).show_ui(ui, |ui| {
+                    for c in Colour::ALL {
+                        ui.selectable_value(&mut self.s.colour, c, c.label());
+                    }
+                })
+                .response
+                .on_hover_text("Natural: removes the colour cast of faded film and restores contrast. Vivid: stronger contrast and colours.");
             });
         });
+        if before != (self.s.dust, self.s.dust_strength, self.s.colour) {
+            self.request_preview(self.frame);
+        }
         ui.separator();
         ui.heading("Output");
         ui.add_enabled_ui(!busy, |ui| {
@@ -682,6 +671,13 @@ impl App {
             if ui.checkbox(&mut self.s.show_seam, "Show seam").changed() {
                 self.request_preview(self.frame);
             }
+            if ui
+                .add_enabled(self.job.is_none(), egui::Button::new("Side-by-side clip"))
+                .on_hover_text("Writes a 10-second clip around this frame next to the video: original on the left, result on the right")
+                .clicked()
+            {
+                self.compare_clip();
+            }
             if self.preview_job.is_some() {
                 ui.spinner();
             }
@@ -807,16 +803,8 @@ impl eframe::App for App {
                 if ui.add_enabled(!busy && has_video, egui::Button::new(RichText::new("1. Analyze").strong())).clicked() {
                     self.analyze();
                 }
-                let t = if self.s.stabilize { "2. Repair and stabilize" } else { "2. Repair" };
-                if ui.add_enabled(!busy && self.analysis.is_some(), egui::Button::new(RichText::new(t).strong())).clicked() {
+                if ui.add_enabled(!busy && self.analysis.is_some(), egui::Button::new(RichText::new("2. Repair").strong())).clicked() {
                     self.repair();
-                }
-                if ui
-                    .add_enabled(!busy && has_video, egui::Button::new("Stabilize only"))
-                    .on_hover_text("Stabilize the chosen video as it is (no slip repair)")
-                    .clicked()
-                {
-                    self.stabilize_only();
                 }
                 if ui.add_enabled(busy, egui::Button::new("Stop")).clicked() {
                     crate::STOP.store(true, Ordering::Relaxed);

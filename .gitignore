@@ -4,7 +4,6 @@
 *.pt
 !models/slip_classifier.pt
 *.s8analysis.bin
-*.s8motion.bin
 *.s8edits.json
 *_shifts.csv
 __pycache__/

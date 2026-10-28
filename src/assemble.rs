@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 const MAX_DY: i64 = 16; // vertical fine adjustment at the seam (px)
 const MAX_DX: i64 = 24; // horizontal weave between film frames (px)
+const FINE_DX: i64 = 6; // exact horizontal search around the coarse result (px)
+const BAND: i64 = 96; // rows of the kept part used to measure the weave of an intact neighbour
 pub const NEIGHBOURS: usize = 2; // the smaller part is fetched from at most this many video frames away
 const BAND_RANGE: i64 = 28; // a dark frame-line band is searched this close to the seam (px)
 const SEAM_MAX: f32 = 40.0; // largest seam blend width (px)
@@ -147,6 +149,62 @@ fn fill_band(img: &mut [u8], k: Size, (b0, b1): (i64, i64)) {
     }
 }
 
+/// Gray values of one full row.
+fn gray_row(img: &[u8], k: Size, y: i64) -> Vec<f32> {
+    img[y as usize * k.w * 3..(y as usize + 1) * k.w * 3].chunks_exact(3).map(|p| (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0).collect()
+}
+
+/// Horizontal offset (px) of candidate row `y` that continues the rows `edge` (next to the seam,
+/// then one further) best, searched at 1 px around the coarse result `dx0`.
+fn fine_dx(cand: &[u8], cur: &[u8], k: Size, y: i64, edge: (i64, i64), dx0: i64) -> i64 {
+    let row = gray_row(cand, k, y);
+    let a1 = gray_row(cur, k, edge.0);
+    let a2 = gray_row(cur, k, edge.1);
+    let w = k.w as i64;
+    let inner = MAX_DX as usize + FINE_DX as usize..k.w - MAX_DX as usize - FINE_DX as usize;
+    let mut best = (f32::INFINITY, dx0);
+    for dx in (dx0 - FINE_DX).max(-MAX_DX)..=(dx0 + FINE_DX).min(MAX_DX) {
+        let mut e = 0f32;
+        for x in inner.clone() {
+            let r = row[(x as i64 - dx).rem_euclid(w) as usize];
+            e += (r - a1[x]).abs() + (r - (2.0 * a1[x] - a2[x])).abs();
+        }
+        let e = e / (2 * inner.len()) as f32 + 0.01 * dx.abs() as f32;
+        if e < best.0 {
+            best = (e, dx);
+        }
+    }
+    best.1
+}
+
+/// Horizontal offset (px) that aligns `rows + dy` of the candidate with `rows` of the current frame,
+/// compared on horizontal gradients (insensitive to exposure differences between film frames).
+fn band_dx(cand: &[u8], cur: &[u8], k: Size, rows: &[i64], dy: i64) -> i64 {
+    let h = k.h as i64;
+    let rows: Vec<i64> = rows.iter().copied().filter(|&y| y >= 0 && y < h && y + dy >= 0 && y + dy < h).step_by(2).collect();
+    if rows.len() < 8 {
+        return 0;
+    }
+    let grad = |r: Vec<f32>| -> Vec<f32> { r.windows(2).map(|p| p[1] - p[0]).collect() };
+    let a: Vec<Vec<f32>> = rows.iter().map(|&y| grad(gray_row(cur, k, y))).collect();
+    let b: Vec<Vec<f32>> = rows.iter().map(|&y| grad(gray_row(cand, k, y + dy))).collect();
+    let n = k.w - 1;
+    let inner = MAX_DX as usize + 1..n - MAX_DX as usize - 1;
+    let mut best = (f32::INFINITY, 0);
+    for dx in -MAX_DX..=MAX_DX {
+        let mut e = 0f32;
+        for (ra, rb) in a.iter().zip(&b) {
+            for x in inner.clone() {
+                e += (rb[(x as i64 - dx) as usize] - ra[x]).abs();
+            }
+        }
+        if e < best.0 {
+            best = (e, dx);
+        }
+    }
+    best.1
+}
+
 struct Candidate<'a> {
     img: std::borrow::Cow<'a, [u8]>,
     /// shift of the candidate itself (0 = an intact frame)
@@ -237,6 +295,19 @@ pub fn repair_frame(fr: &[u8], k: Size, job: FrameJob, neighbours: &[(Option<&[u
     }
     if !best.0.is_finite() {
         best = (SEAM_MAX, 0, 0, 0);
+    } else {
+        // the coarse search moved in steps of 4 px: find the exact horizontal offset at full
+        // resolution, so that vertical structures (a tree trunk, a door frame) continue over the seam
+        let c = &cand[best.1];
+        if c.shift == 0 && c.offset != 0 {
+            // an intact neighbour shows the same rows as the kept part: measure the horizontal weave
+            // between the two film frames over a wide band of the kept part
+            let band: Vec<i64> = if top_big { (s - BAND..s - 4).collect() } else { (s + 4..s + BAND).collect() };
+            best.3 = band_dx(&c.img, &out, k, &band, best.2);
+        } else {
+            let y = if top_big { s + best.2 } else { s - 1 + best.2 };
+            best.3 = fine_dx(&c.img, &out, k, y, if top_big { (s - 1, s - 2) } else { (s, s + 1) }, best.3);
+        }
     }
     let (err, ci, dy, dx) = (best.0, best.1, best.2 + job.nudge.0, best.3 + job.nudge.1);
     let rows: Vec<i64> = if top_big { (s..h).collect() } else { (0..s).collect() };

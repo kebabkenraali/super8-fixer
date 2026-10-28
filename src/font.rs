@@ -1,4 +1,4 @@
-//! A tiny 5x7 bitmap font for timestamps (digits and : # . -).
+//! A tiny 5x7 bitmap font for timestamps and labels (digits, : # . - and a few capital letters).
 
 const GLYPHS: &[(char, [u8; 7])] = &[
     ('0', [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E]),
@@ -15,19 +15,45 @@ const GLYPHS: &[(char, [u8; 7])] = &[
     ('.', [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C]),
     ('-', [0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00]),
     ('#', [0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A]),
+    ('A', [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11]),
+    ('D', [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E]),
+    ('E', [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F]),
+    ('G', [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F]),
+    ('I', [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E]),
+    ('L', [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F]),
+    ('N', [0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11]),
+    ('O', [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E]),
+    ('P', [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10]),
+    ('R', [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11]),
 ];
 
 /// Draws text into the image at (x, y), scale 2.
 pub fn draw(img: &mut image::RgbImage, x: u32, y: u32, text: &str, color: [u8; 3]) {
+    draw_scaled(img, x, y, text, color, 2);
+}
+
+/// White text on a dark box at (x, y); `scale` = pixels per font dot.
+pub fn label(img: &mut image::RgbImage, x: u32, y: u32, text: &str, scale: u32) {
+    let (bw, bh) = (text.chars().count() as u32 * 6 * scale + 2 * scale, 9 * scale);
+    for yy in y.saturating_sub(scale)..(y + bh).min(img.height()) {
+        for xx in x.saturating_sub(scale)..(x + bw).min(img.width()) {
+            let p = img.get_pixel_mut(xx, yy);
+            p.0 = [p.0[0] / 3, p.0[1] / 3, p.0[2] / 3];
+        }
+    }
+    draw_scaled(img, x, y, text, [255, 255, 255], scale);
+}
+
+fn draw_scaled(img: &mut image::RgbImage, x: u32, y: u32, text: &str, color: [u8; 3], scale: u32) {
     let mut cx = x;
     for c in text.chars() {
         if let Some((_, rows)) = GLYPHS.iter().find(|(m, _)| *m == c) {
             for (ry, r) in rows.iter().enumerate() {
                 for rx in 0..5 {
                     if r & (0x10 >> rx) != 0 {
-                        for dy in 0..2 {
-                            for dx in 0..2 {
-                                let (px, py) = (cx + rx * 2 + dx, y + ry as u32 * 2 + dy);
+                        for dy in 0..scale {
+                            for dx in 0..scale {
+                                let (px, py) = (cx + rx * scale + dx, y + ry as u32 * scale + dy);
                                 if px < img.width() && py < img.height() {
                                     img.put_pixel(px, py, image::Rgb(color));
                                 }
@@ -37,6 +63,6 @@ pub fn draw(img: &mut image::RgbImage, x: u32, y: u32, text: &str, color: [u8; 3
                 }
             }
         }
-        cx += 12;
+        cx += 6 * scale;
     }
 }

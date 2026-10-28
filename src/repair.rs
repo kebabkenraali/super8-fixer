@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::analysis::{self, AH, Run};
 use crate::assemble::{self, Fill, FrameJob, NEIGHBOURS, Size};
+use crate::enhance::{self, Colour, EnhanceSettings, Enhancer, Levels};
 use crate::model::{self, Classifier};
 use crate::video::{Reader, VideoInfo, Writer, parse_range};
 
@@ -25,6 +26,8 @@ pub struct RepairSettings {
     pub assemble: bool,
     /// automatic seam refinement against neighbouring frames
     pub refine: bool,
+    /// dust removal and colour restoration
+    pub enhance: EnhanceSettings,
     pub crf: u32,
     pub preset: String,
     pub gpu: bool,
@@ -40,6 +43,7 @@ impl Default for RepairSettings {
             force: vec![],
             assemble: true,
             refine: false,
+            enhance: EnhanceSettings::default(),
             crf: 16,
             preset: "medium".into(),
             gpu: true,
@@ -348,29 +352,128 @@ pub struct Preview {
     pub seam: Option<(usize, usize)>,
 }
 
-/// One repaired frame for the preview, at full size.
-pub fn preview(an: &Analysis, i: usize, assemble: bool) -> Result<Preview> {
+type Originals = std::collections::VecDeque<(usize, Vec<u8>)>;
+
+/// Repairs and enhances the frames `start..start+count` (to the end of the video when `count` is
+/// None) and calls `sink(original, result)` for every frame in order. `levels`: colour levels per
+/// frame starting at frame `levels.1`, or one entry for all frames.
+fn process(
+    an: &Analysis,
+    a: &RepairSettings,
+    start: usize,
+    count: Option<usize>,
+    levels: (Vec<Levels>, usize),
+    progress: Option<&str>,
+    mut sink: impl FnMut(&[u8], Vec<u8>) -> Result<()>,
+) -> Result<usize> {
     let v = &an.info;
-    let start = i.saturating_sub(NEIGHBOURS);
+    let jobs = an.jobs(a.assemble);
+    let k = Size { w: v.w, h: v.h };
     let size = v.w * v.h * 3;
-    let mut r = Reader::new(&v.path, None, "rgb24", size, Some(start as f64 / v.fps), Some(2 * NEIGHBOURS + 1))?;
-    let mut frames: Vec<Option<Vec<u8>>> = vec![None; NEIGHBOURS - (i - start)];
-    while let Some(b) = r.next_frame() {
-        frames.push(Some(b));
+    let reach = if a.enhance.dust { enhance::REACH } else { 0 };
+    // the dust removal needs `reach` repaired frames on both sides, the repair NEIGHBOURS more
+    let lead = start.saturating_sub(reach);
+    let end = count.map(|c| start + c);
+    let read_from = lead.saturating_sub(NEIGHBOURS);
+    let max_frames = end.map(|e| e + reach + NEIGHBOURS - read_from);
+    let mut r = Reader::new(&v.path, None, "rgb24", size, (read_from > 0).then(|| read_from as f64 / v.fps), max_frames)?;
+    let mut enh = a.enhance.active().then(|| Enhancer::new(a.enhance, v.w, v.h, levels.0, levels.1).starting_at(lead));
+    let mut originals: Originals = Default::default();
+    let mut done = 0usize;
+    let mut emit = |outs: Vec<Vec<u8>>, originals: &mut Originals, done: &mut usize| -> Result<()> {
+        for o in outs {
+            let (i, orig) = originals.pop_front().unwrap();
+            if i >= start && end.is_none_or(|e| i < e) {
+                sink(&orig, o)?;
+                *done += 1;
+            }
+        }
+        Ok(())
+    };
+    const BATCH: usize = 24;
+    // window[0] = frame `pos - NEIGHBOURS`
+    let mut window: Vec<Option<Vec<u8>>> = vec![None; NEIGHBOURS - (lead - read_from)];
+    let mut pos = lead;
+    let mut ended = false;
+    loop {
+        crate::check_stop()?;
+        while !ended && window.len() < NEIGHBOURS + BATCH + NEIGHBOURS {
+            match r.next_frame() {
+                Some(b) => window.push(Some(b)),
+                None => ended = true,
+            }
+        }
+        let available = window.len().saturating_sub(NEIGHBOURS);
+        let n = if ended { available } else { available.saturating_sub(NEIGHBOURS).min(BATCH) };
+        if n == 0 {
+            break;
+        }
+        let repaired: Vec<Vec<u8>> = if jobs[pos.min(jobs.len())..(pos + n).min(jobs.len())].iter().all(|j| j.shift == 0) {
+            (0..n).map(|d| window[NEIGHBOURS + d].clone().unwrap()).collect()
+        } else {
+            // at the end of the video there are no frames in the neighbour slots
+            while window.len() < NEIGHBOURS + n + NEIGHBOURS {
+                window.push(None);
+            }
+            assemble::repair_batch(&window, pos, n, k, &jobs)
+        };
+        for (d, f) in repaired.into_iter().enumerate() {
+            originals.push_back((pos + d, window[NEIGHBOURS + d].clone().unwrap()));
+            let outs = match &mut enh {
+                Some(e) => e.push(f),
+                None => vec![f],
+            };
+            emit(outs, &mut originals, &mut done)?;
+        }
+        pos += n;
+        if let Some(p) = progress {
+            let total = count.unwrap_or(v.n);
+            crate::progress(&format!("{p}: {done} / {total} frames"), done, total.max(done));
+        }
+        if ended {
+            break;
+        }
+        window.drain(..n);
     }
-    while frames.len() < 2 * NEIGHBOURS + 1 {
-        frames.push(None);
+    if let Some(e) = &mut enh {
+        let outs = e.finish();
+        emit(outs, &mut originals, &mut done)?;
+        if a.enhance.dust && progress.is_some() {
+            crate::log(&format!("Dust and dirt: {} spots removed.", e.spots));
+        }
     }
-    let original = frames[NEIGHBOURS].clone().ok_or_else(|| anyhow::anyhow!("frame {i} could not be read"))?;
-    let jobs = an.jobs(assemble);
-    let repaired = assemble::repair_batch(&frames, i, 1, Size { w: v.w, h: v.h }, &jobs).into_iter().next().unwrap();
-    let s = jobs.get(i).map(|j| j.shift).unwrap_or(0);
+    Ok(done)
+}
+
+/// One repaired and enhanced frame for the preview, at full size.
+pub fn preview(an: &Analysis, i: usize, a: &RepairSettings) -> Result<Preview> {
+    let v = &an.info;
+    let levels = if a.enhance.colour != Colour::Off { local_levels(v, i)? } else { vec![] };
+    let mut res = None;
+    process(an, a, i, Some(1), (levels, 0), None, |o, f| {
+        res = Some((o.to_vec(), f));
+        Ok(())
+    })?;
+    let (original, repaired) = res.ok_or_else(|| anyhow::anyhow!("frame {i} could not be read"))?;
+    let s = an.jobs(a.assemble).get(i).map(|j| j.shift).unwrap_or(0);
     let seam = (s != 0).then(|| ((v.h - s) % v.h, s));
     Ok(Preview { original, repaired, seam })
 }
 
+/// Colour levels from a few frames around `i` (one entry, used for all frames).
+fn local_levels(v: &VideoInfo, i: usize) -> Result<Vec<Levels>> {
+    let a = i.saturating_sub(6);
+    let mut r = Reader::new(&v.path, None, "rgb24", v.w * v.h * 3, Some(a as f64 / v.fps), Some(13))?;
+    let mut f = Vec::new();
+    while let Some(b) = r.next_frame() {
+        f.push(b);
+    }
+    let refs: Vec<&[u8]> = f.iter().step_by(3).map(|x| &x[..]).collect();
+    Ok(if refs.is_empty() { vec![] } else { vec![enhance::levels_of(&refs, v.w, v.h)] })
+}
+
 /// Before/after page with the middle frame of every repaired run.
-pub fn before_after(an: &Analysis, path: &str, assemble: bool) -> Result<()> {
+pub fn before_after(an: &Analysis, path: &str, a: &RepairSettings) -> Result<()> {
     let v = &an.info;
     let rows: Vec<&Run> = an.runs.iter().filter(|r| r.repair).collect();
     if rows.is_empty() {
@@ -381,7 +484,7 @@ pub fn before_after(an: &Analysis, path: &str, assemble: bool) -> Result<()> {
     for (n, r) in rows.iter().enumerate() {
         crate::check_stop()?;
         let i = (r.start + r.end) / 2;
-        let p = preview(an, i, assemble)?;
+        let p = preview(an, i, a)?;
         for (x0, img) in [(0u32, p.original), (tw + 10, p.repaired)] {
             let im = image::RgbImage::from_raw(v.w as u32, v.h as u32, img).unwrap();
             let mut small = image::imageops::resize(&im, tw, th, image::imageops::FilterType::Triangle);
@@ -394,53 +497,43 @@ pub fn before_after(an: &Analysis, path: &str, assemble: bool) -> Result<()> {
     Ok(())
 }
 
-/// Renders the repaired video.
+/// Renders the repaired (and enhanced) video.
 pub fn render(an: &Analysis, a: &RepairSettings, out: &str) -> Result<usize> {
     let v = &an.info;
-    let jobs = an.jobs(a.assemble);
-    let k = Size { w: v.w, h: v.h };
-    let size = v.w * v.h * 3;
-    let mut r = Reader::new(&v.path, None, "rgb24", size, None, None)?;
+    let levels = if a.enhance.colour != Colour::Off { enhance::colour_levels(v, 0, None)? } else { vec![] };
     let mut w = Writer::new(out, v, a.crf, &a.preset, v.audio.then_some(v.path.as_str()))?;
-    const BATCH: usize = 24;
-    // window[0] = frame `start - NEIGHBOURS`
-    let mut window: Vec<Option<Vec<u8>>> = vec![None; NEIGHBOURS];
-    let mut start = 0usize;
-    let mut ended = false;
-    loop {
-        crate::check_stop()?;
-        while !ended && window.len() < NEIGHBOURS + BATCH + NEIGHBOURS {
-            match r.next_frame() {
-                Some(b) => window.push(Some(b)),
-                None => ended = true,
-            }
-        }
-        let available = window.len().saturating_sub(NEIGHBOURS);
-        let count = if ended { available } else { available.saturating_sub(NEIGHBOURS).min(BATCH) };
-        if count == 0 {
-            break;
-        }
-        if jobs[start.min(jobs.len())..(start + count).min(jobs.len())].iter().all(|j| j.shift == 0) {
-            for d in 0..count {
-                w.write(window[NEIGHBOURS + d].as_ref().unwrap())?;
-            }
-        } else {
-            // at the end of the video there are no frames in the neighbour slots
-            while window.len() < NEIGHBOURS + count + NEIGHBOURS {
-                window.push(None);
-            }
-            for f in assemble::repair_batch(&window, start, count, k, &jobs) {
-                w.write(&f)?;
-            }
-        }
-        start += count;
-        crate::progress(&format!("Rendering the repaired video: {start} / {} frames", v.n), start, v.n.max(start));
-        if ended {
-            break;
-        }
-        window.drain(..count);
-    }
+    let n = process(an, a, 0, None, (levels, 0), Some("Rendering"), |_, f| w.write(&f))?;
     w.finish()?;
-    crate::log(&format!("Done: {out} ({start} frames)"));
-    Ok(start)
+    crate::log(&format!("Done: {out} ({n} frames)"));
+    Ok(n)
+}
+
+/// A side-by-side clip of `seconds` around frame `centre`: the original on the left, the result on
+/// the right. Written next to the video as VIDEO_compare_MMmSSs.mp4; returns the path.
+pub fn compare_clip(an: &Analysis, a: &RepairSettings, centre: usize, seconds: f64) -> Result<String> {
+    let v = &an.info;
+    let len = ((seconds * v.fps).round() as usize).clamp(1, v.n.max(1));
+    let start = centre.saturating_sub(len / 2).min(v.n.saturating_sub(len));
+    let secs = (centre as f64 / v.fps) as u64;
+    let out = with_suffix(&stem(&v.path), &format!("_compare_{:02}m{:02}s.mp4", secs / 60, secs % 60));
+    let levels = if a.enhance.colour != Colour::Off { enhance::colour_levels(v, start, Some(len))? } else { vec![] };
+    let mut sv = v.clone();
+    sv.w = v.w * 2;
+    let mut w = Writer::new(&out, &sv, a.crf.max(18), "fast", None)?;
+    let row = v.w * 3;
+    let scale = (v.h / 180).max(2) as u32;
+    let n = process(an, a, start, Some(len), (levels, start), Some("Side-by-side clip"), |o, f| {
+        let mut both = vec![0u8; sv.w * v.h * 3];
+        for y in 0..v.h {
+            both[y * 2 * row..y * 2 * row + row].copy_from_slice(&o[y * row..(y + 1) * row]);
+            both[y * 2 * row + row..(y + 1) * 2 * row].copy_from_slice(&f[y * row..(y + 1) * row]);
+        }
+        let mut img = image::RgbImage::from_raw(sv.w as u32, v.h as u32, both).unwrap();
+        crate::font::label(&mut img, 8 * scale, 8 * scale, "ORIGINAL", scale);
+        crate::font::label(&mut img, v.w as u32 + 8 * scale, 8 * scale, "REPAIRED", scale);
+        w.write(img.as_raw())
+    })?;
+    w.finish()?;
+    crate::log(&format!("Side-by-side clip: {out} ({n} frames)"));
+    Ok(out)
 }

@@ -1,18 +1,18 @@
-//! Super8 Fixer: repairs frame-line slips in digitized Super 8 / 8 mm film and stabilizes the
-//! picture, as a native Windows application. Without arguments (or with a video file as the only
-//! argument) the window opens; command line:
-//!   Super8Fixer.exe {repair|stabilize|all} VIDEO [options]
+//! Super8 Fixer: repairs frame-line slips in digitized Super 8 / 8 mm film, removes dust and dirt
+//! and restores faded colours, as a native Windows application. Without arguments (or with a video
+//! file as the only argument) the window opens; command line:
+//!   Super8Fixer.exe {repair|compare} VIDEO [options]
 
 #![windows_subsystem = "windows"]
 
 mod analysis;
 mod assemble;
+mod enhance;
 mod font;
 mod gui;
 mod model;
 mod refine;
 mod repair;
-mod stabilize;
 mod video;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,10 +107,9 @@ impl Args {
 }
 
 const HELP: &str = "Usage:
-  Super8Fixer.exe [VIDEO]                      open the window
-  Super8Fixer.exe repair VIDEO [options]       repair frame-line slips -> VIDEO_repaired.mp4
-  Super8Fixer.exe stabilize VIDEO [options]    stabilize the picture -> VIDEO_stable.mp4
-  Super8Fixer.exe all VIDEO [options]          repair, then stabilize -> VIDEO_repaired_stable.mp4
+  Super8Fixer.exe [VIDEO]                    open the window
+  Super8Fixer.exe repair VIDEO [options]     repair slips, remove dust, restore colours -> VIDEO_repaired.mp4
+  Super8Fixer.exe compare VIDEO --at 05:10   10 s side by side: original | result -> VIDEO_compare_05m10s.mp4
 
 Repair:
   --analyze-only         only the report and the before/after image
@@ -122,13 +121,15 @@ Repair:
   --roll-only            only roll the frames, do not rebuild them from neighbours
   --refine               experimental: automatic seam refinement against neighbouring frames
   Edits saved in the window (VIDEO.s8edits.json) are applied automatically.
-Stabilization:
-  --smoothing 6          smoothing width in film frames (larger = steadier)
-  --max-shift 3          largest correction as a percentage of the width
-  --scene-threshold 30   picture difference that starts a new scene
-  --measure-only         measure the shake, do not render
+Picture:
+  --no-dust              do not remove dust and dirt
+  --dust-strength 1.0    dust sensitivity, 0.5 (clear spots only) .. 2.0 (also faint ones)
+  --colour natural       colour restoration: off, natural or vivid
+Compare:
+  --at 05:10             centre of the clip (default: the middle of the first repaired run)
+  --seconds 10           length of the clip
 Common:
-  -o FILE                output file
+  -o FILE                output file (repair)
   --crf 16  --preset medium   x264 quality
   --cpu                  do not use the GPU";
 
@@ -139,13 +140,14 @@ fn command_line(args: Vec<String>) -> Result<()> {
         println!("{HELP}");
         return Ok(());
     }
-    if !matches!(cmd.as_str(), "repair" | "stabilize" | "all") {
+    if !matches!(cmd.as_str(), "repair" | "compare") {
         bail!("Unknown command {cmd}\n{HELP}");
     }
     let out = a.value("-o").or_else(|| a.value("--output"));
-    let gpu = !a.flag("--cpu");
-    let crf = a.number("--crf", 16u32)?;
-    let preset = a.value("--preset").unwrap_or_else(|| "medium".into());
+    let colour = match a.value("--colour").or_else(|| a.value("--color")) {
+        Some(c) => enhance::Colour::parse(&c).ok_or_else(|| anyhow!("--colour must be off, natural or vivid"))?,
+        None => enhance::Colour::Natural,
+    };
     let rs = repair::RepairSettings {
         threshold: a.number("--threshold", 0.45f32)?,
         use_model: !a.flag("--no-model"),
@@ -154,47 +156,38 @@ fn command_line(args: Vec<String>) -> Result<()> {
         force: a.values("--force"),
         assemble: !a.flag("--roll-only"),
         refine: a.flag("--refine"),
-        crf,
-        preset: preset.clone(),
-        gpu,
-    };
-    let ss = stabilize::StabilizeSettings {
-        smoothing: a.number("--smoothing", 6.0)?,
-        max_shift: a.number("--max-shift", 3.0)?,
-        scene_threshold: a.number("--scene-threshold", 30.0)?,
-        crf,
-        preset,
+        enhance: enhance::EnhanceSettings { dust: !a.flag("--no-dust"), dust_strength: a.number("--dust-strength", 1.0f32)?, colour },
+        crf: a.number("--crf", 16u32)?,
+        preset: a.value("--preset").unwrap_or_else(|| "medium".into()),
+        gpu: !a.flag("--cpu"),
     };
     let analyze_only = a.flag("--analyze-only");
-    let measure_only = a.flag("--measure-only");
+    let at = a.value("--at");
+    let seconds = a.number("--seconds", 10.0f64)?;
     if let Some(x) = a.0.iter().find(|x| x.starts_with("--")) {
         bail!("Unknown option {x}\n{HELP}");
     }
     let video = a.0.first().cloned().ok_or_else(|| anyhow!("the video is missing\n{HELP}"))?;
     let stem = repair::stem(&video);
-    let mut to_stabilize = video.clone();
-    if cmd != "stabilize" {
-        let an = repair::analyze(&video, &rs)?;
-        let img = repair::with_suffix(&stem, "_before_after.png");
-        repair::before_after(&an, &img, rs.assemble)?;
-        if an.runs.iter().any(|r| r.repair) {
-            log(&format!("Before/after images: {img}"));
-        }
-        if analyze_only {
-            return Ok(());
-        }
-        let o = match (&out, cmd.as_str()) {
-            (Some(o), "repair") => o.clone(),
-            _ => repair::with_suffix(&stem, "_repaired.mp4"),
+    let an = repair::analyze(&video, &rs)?;
+    if cmd == "compare" {
+        let centre = match at {
+            Some(t) => video::parse_range(&format!("{t}-{t}"), an.info.fps)?.0,
+            None => an.runs.iter().find(|r| r.repair).map(|r| (r.start + r.end) / 2).ok_or_else(|| anyhow!("no repaired runs; give --at"))?,
         };
-        repair::render(&an, &rs, &o)?;
-        to_stabilize = o;
+        repair::compare_clip(&an, &rs, centre, seconds)?;
+        return Ok(());
     }
-    if cmd != "repair" {
-        let v = video::VideoInfo::read(&to_stabilize)?;
-        let o = out.unwrap_or_else(|| repair::with_suffix(&repair::stem(&to_stabilize), "_stable.mp4"));
-        stabilize::stabilize(&v, &ss, if measure_only { None } else { Some(&o) })?;
+    let img = repair::with_suffix(&stem, "_before_after.png");
+    repair::before_after(&an, &img, &rs)?;
+    if an.runs.iter().any(|r| r.repair) {
+        log(&format!("Before/after images: {img}"));
     }
+    if analyze_only {
+        return Ok(());
+    }
+    let o = out.unwrap_or_else(|| repair::with_suffix(&stem, "_repaired.mp4"));
+    repair::render(&an, &rs, &o)?;
     Ok(())
 }
 

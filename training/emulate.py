@@ -5,7 +5,7 @@ Produces three files:
   <out>_reference.mp4   the same without slips (the ideal repair result)
   <out>_truth.npz       exact information for every video frame: frame-line row, slip, weave, duplicate, scene
 
-This way the repair and stabilization accuracy can be measured and the slip classifier trained without
+This way the repair accuracy can be measured and the slip classifier trained without
 anybody's own home movies.
 
 Model: the film is a strip where every film frame is PIC_H rows of picture + a dark frame line. The
