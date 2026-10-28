@@ -139,6 +139,13 @@ Prelinger Archives
 Super8Fixer.exe does not connect to the network. Videos, analyses and edits stay on your computer.
 Only `get-ffmpeg.cmd`, when you run it, downloads ffmpeg from GitHub.
 
+## Contributors
+
+- **kebabkenraali** - idea, project lead, testing on real film transfers
+- **Claude** (Anthropic AI) - code, slip classifier, training tools and documentation
+
+See [AUTHORS.md](AUTHORS.md).
+
 ## License
 
 Super8 Fixer is free for any **noncommercial** use: you may use, copy, modify and share it, but not

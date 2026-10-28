@@ -26,7 +26,7 @@ if ($crt) {
 }
 
 Copy-Item "scripts\get-ffmpeg.ps1", "scripts\get-ffmpeg.cmd" $out -Force
-Copy-Item "README.md", "LICENSE.md", "MODEL_CARD.md", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_LICENSES.txt" $out -Force
+Copy-Item "README.md", "AUTHORS.md", "LICENSE.md", "MODEL_CARD.md", "THIRD_PARTY_NOTICES.md", "THIRD_PARTY_LICENSES.txt" $out -Force
 New-Item -ItemType Directory -Force "$out\licenses" | Out-Null
 Copy-Item "licenses\*" "$out\licenses\" -Force
 
