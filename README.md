@@ -18,7 +18,7 @@ and rebuilds the missing part from the neighbouring frames, so that the seam doe
 frame and the bottom shows the top of the next. Right: the same frame repaired by Super8 Fixer - one
 whole film frame again. Emulated slips made from public-domain films of the Prelinger Archives.*
 
-Made with Claude AI
+Built with [Claude Code](https://claude.com/claude-code) by Anthropic
 
 ## What's new in 1.2.0
 
