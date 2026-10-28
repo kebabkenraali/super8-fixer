@@ -222,6 +222,8 @@ const MAX_AREA: f64 = 0.0006; // largest spot as a share of the picture area
 const MIN_AREA: f64 = 0.000015; // smallest spot (10 px in a 960 x 720 picture); smaller ones are grain
 const MAX_SIDE: f64 = 0.05; // largest spot side as a share of the picture width
 const GROW: usize = 2; // the mask is grown by this many pixels around a spot
+const MIN_FILL: f32 = 0.35; // a spot fills at least this share of its bounding box
+const MAX_RESIDUAL: f32 = 9.0; // a neighbour is used only if it lines up this well (mean gray difference)
 
 fn gray_full(rgb: &[u8]) -> Vec<f32> {
     rgb.par_chunks(3 * 1024).flat_map_iter(|c| c.chunks_exact(3).map(|p| (p[0] as f32 + p[1] as f32 + p[2] as f32) / 3.0)).collect()
@@ -358,9 +360,23 @@ fn remove_dust(cur: &mut [u8], c: &Frame, prevs: &[Option<&Frame>], nexts: &[Opt
             }
         }
         // a single pixel is noise, a large or long area is picture content (moving objects)
-        if px.len() >= min_area && px.len() <= max_area && x1 - x0 <= max_side && y1 - y0 <= max_side {
-            spots.push(px);
+        if px.len() < min_area || px.len() > max_area || x1 - x0 > max_side || y1 - y0 > max_side {
+            continue;
         }
+        // dust is a compact spot; thin strokes are the edges of something that moved
+        let (bw, bh) = (x1 - x0 + 1, y1 - y0 + 1);
+        if (px.len() as f32) < MIN_FILL * (bw * bh) as f32 || bw.max(bh) > 3 * bw.min(bh) + 3 {
+            continue;
+        }
+        // the spot differs from its own surroundings, and the neighbours' picture fits into them
+        let ring = ring_median(gc, w, h, (x0, x1, y0, y1), &label);
+        let spot = px.iter().map(|&i| gc[i]).sum::<f32>() / px.len() as f32;
+        let filled = px.iter().map(|&i| (p.gray[at(i % w, i / w, dp)] + n.gray[at(i % w, i / w, dn)]) / 2.0).sum::<f32>() / px.len() as f32;
+        let contrast = (spot - ring).abs();
+        if contrast < 0.5 * t || (filled - ring).abs() > 0.5 * contrast {
+            continue;
+        }
+        spots.push(px);
     }
     let mut fill = vec![false; w * h];
     for s in &spots {
@@ -387,8 +403,28 @@ fn remove_dust(cur: &mut [u8], c: &Frame, prevs: &[Option<&Frame>], nexts: &[Opt
     spots.len()
 }
 
-/// Refines a translation at full resolution within +-2 px.
-fn refine_full(a: &[f32], b: &[f32], w: usize, h: usize, d: (i64, i64)) -> (i64, i64) {
+/// Median gray of a ring 3..6 px around the box (x0, x1, y0, y1), outside the marked pixels.
+fn ring_median(g: &[f32], w: usize, h: usize, (x0, x1, y0, y1): (usize, usize, usize, usize), marked: &[bool]) -> f32 {
+    let (ox0, ox1) = (x0.saturating_sub(6), (x1 + 6).min(w - 1));
+    let (oy0, oy1) = (y0.saturating_sub(6), (y1 + 6).min(h - 1));
+    let mut v = Vec::new();
+    for y in oy0..=oy1 {
+        for x in ox0..=ox1 {
+            let inner = x + 3 > x0 && x < x1 + 3 && y + 3 > y0 && y < y1 + 3;
+            if !inner && !marked[y * w + x] {
+                v.push(g[y * w + x]);
+            }
+        }
+    }
+    if v.is_empty() {
+        return 0.0;
+    }
+    let k = v.len() / 2;
+    *v.select_nth_unstable_by(k, |a, b| a.partial_cmp(b).unwrap()).1
+}
+
+/// Refines a translation at full resolution within +-2 px; also returns the mean difference left.
+fn refine_full(a: &[f32], b: &[f32], w: usize, h: usize, d: (i64, i64)) -> ((i64, i64), f32) {
     let cost = |dx: i64, dy: i64| -> f32 {
         let (mut e, mut n) = (0f32, 0usize);
         for y in (h / 8..h * 7 / 8).step_by(6) {
@@ -410,7 +446,7 @@ fn refine_full(a: &[f32], b: &[f32], w: usize, h: usize, d: (i64, i64)) -> (i64,
             }
         }
     }
-    best.1
+    (best.1, best.0)
 }
 
 /// The nearest neighbour in `list` that is a different film frame (18 -> 25 fps repeats frames),
@@ -418,8 +454,10 @@ fn refine_full(a: &[f32], b: &[f32], w: usize, h: usize, d: (i64, i64)) -> (i64,
 fn pick<'a>(c: &Frame, list: &[Option<&'a Frame>], w: usize, h: usize, scale: f32) -> Option<(&'a Frame, (i64, i64))> {
     for f in list.iter().flatten() {
         let (d, e) = align(&c.small, &f.small, scale);
-        if e > 1.2 && e < 30.0 {
-            return Some((f, refine_full(&c.gray, &f.gray, w, h, d)));
+        if e > 1.2 {
+            // a different film frame: use it only when it lines up well (no strong motion or blur)
+            let (d, rest) = refine_full(&c.gray, &f.gray, w, h, d);
+            return (rest < MAX_RESIDUAL).then_some((f, d));
         }
     }
     None

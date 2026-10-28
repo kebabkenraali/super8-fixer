@@ -31,6 +31,9 @@ Made with Claude AI
   - nudge the filled part vertically and horizontally.
 
   Edits are saved next to the video (`VIDEO.s8edits.json`) and reapplied after a new analysis.
+  Tick only runs that really are slips: repairing an intact picture cuts it in two. In a run you
+  ticked although the analysis judged it not a slip, frames the classifier sees as clearly normal are
+  left as they are.
 - **Dust and dirt removal**: spots that are in one film frame only (dust, hairs, dirt, small
   scratches) are replaced from the aligned previous and next film frames. Only small spots are
   touched, so moving objects stay. The duplicate frames of 18 fps film transferred to 25 fps video are

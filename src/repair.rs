@@ -13,6 +13,10 @@ use crate::enhance::{self, Colour, EnhanceSettings, Enhancer, Levels};
 use crate::model::{self, Classifier};
 use crate::video::{Reader, VideoInfo, Writer, parse_range};
 
+/// A frame inside a repaired run is left as it is when its calibrated classifier probability is
+/// below this (0.5 is the run threshold).
+const FRAME_NORMAL: f32 = 0.1;
+
 #[derive(Clone, Debug)]
 pub struct RepairSettings {
     /// confidence needed to repair a run (when the classifier does not decide)
@@ -71,6 +75,8 @@ pub struct RunEdit {
     pub nudge_x: i64,
     /// ignore the automatic seam refinement in this run
     pub no_refine: bool,
+    /// repair every frame of the run, also those the classifier judged normal
+    pub no_gate: bool,
 }
 
 impl RunEdit {
@@ -104,6 +110,8 @@ pub struct Analysis {
     pub auto_repair: Vec<bool>,
     /// the automatic seam refinement was run
     pub refined: bool,
+    /// frames the classifier judged clearly normal: left as they are in runs ticked by the user
+    pub keep: Vec<bool>,
 }
 
 impl Analysis {
@@ -155,6 +163,11 @@ impl Analysis {
             }
             let e = &self.edits[ri];
             for k in r.start..r.end {
+                // in a run the user ticked against the analysis, a frame the classifier judges clearly
+                // normal is not cut (unless the user set its seam)
+                if !self.auto_repair[ri] && self.keep[k] && !e.frame_offsets.contains_key(&k) && !e.no_gate {
+                    continue;
+                }
                 j[k] = FrameJob {
                     shift: self.shift(ri, k),
                     fill: if assemble { e.fill } else { Fill::RollOnly },
@@ -283,15 +296,27 @@ pub fn analyze(video: &str, a: &RepairSettings) -> Result<Analysis> {
     let none = HashMap::new();
     let preliminary = analysis::decide(&s, &path, a.threshold, &skip, &force, &none, a.model_threshold);
     let mut model_p = HashMap::new();
+    let mut frame_p: HashMap<usize, f32> = HashMap::new();
     if a.use_model {
         if !model::model_path(model::MODEL_FILE).is_file() && !model::model_path(model::PERSONAL_FILE).is_file() {
             crate::log(&format!("(Classifier models\\{} not found: using the confidence value only)", model::MODEL_FILE));
         } else {
             let samples = analysis::model_samples(&path, &preliminary.runs);
-            let need: BTreeSet<usize> = samples.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+            let mut need: BTreeSet<usize> = samples.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+            // every frame of a run whose frame line is inside the picture is also judged on its own
+            let zone = |p: i32| (analysis::MODEL_ZONE * AH as f64) as i32 <= p && p <= ((1.0 - analysis::MODEL_ZONE) * AH as f64) as i32;
+            let single: Vec<usize> = preliminary.runs.iter().flat_map(|r| (r.start..r.end).filter(|&k| zone(path[k]))).collect();
+            need.extend(single.iter().copied());
             if !need.is_empty() {
                 let mut c = Classifier::load(a.gpu)?;
                 let frames = read_small(&v, &need)?;
+                let idx: Vec<usize> = single.iter().copied().filter(|k| frames.contains_key(k)).collect();
+                for chunk in idx.chunks(512) {
+                    let imgs: Vec<Vec<u8>> = chunk.iter().map(|k| frames[k].clone()).collect();
+                    for (&k, p) in chunk.iter().zip(c.predict(&imgs)?) {
+                        frame_p.insert(k, c.calibrate(p));
+                    }
+                }
                 for (key, idx) in samples {
                     let k: Vec<Vec<u8>> = idx.iter().filter_map(|i| frames.get(i).cloned()).collect();
                     if k.is_empty() {
@@ -308,7 +333,12 @@ pub fn analyze(video: &str, a: &RepairSettings) -> Result<Analysis> {
     let n = path.len();
     let auto_repair = d.runs.iter().map(|r| r.repair).collect();
     let edits = d.runs.iter().map(RunEdit::for_run).collect();
-    let mut an = Analysis { info: v, path, runs: d.runs, reference: d.reference, auto_adjust: vec![0; n], edits, auto_repair, refined: a.refine };
+    let mut keep = vec![false; n];
+    for (&k, &p) in &frame_p {
+        keep[k] = p < FRAME_NORMAL;
+    }
+    let mut an =
+        Analysis { info: v, path, runs: d.runs, reference: d.reference, auto_adjust: vec![0; n], edits, auto_repair, refined: a.refine, keep };
     if a.refine && !an.runs.is_empty() {
         crate::log("Refining the seam positions against neighbouring frames...");
         let jobs: Vec<(usize, usize, Vec<usize>)> = an
@@ -328,10 +358,10 @@ pub fn analyze(video: &str, a: &RepairSettings) -> Result<Analysis> {
         crate::log(&format!("Seam refinement changed {changed} frames."));
         // development aid: SUPER8FIXER_DUMP=1 writes the tracked and refined shift of every run frame
         if std::env::var_os("SUPER8FIXER_DUMP").is_some() {
-            let mut t = String::from("frame,base,adjust\n");
+            let mut t = String::from("frame,base,adjust,keep\n");
             for (ri, r) in an.runs.iter().enumerate() {
                 for k in r.start..r.end {
-                    t += &format!("{k},{},{}\n", an.base_shift(ri, k).rem_euclid(an.info.h as i64), an.auto_adjust[k]);
+                    t += &format!("{k},{},{},{}\n", an.base_shift(ri, k).rem_euclid(an.info.h as i64), an.auto_adjust[k], u8::from(an.keep[k]));
                 }
             }
             let _ = std::fs::write(with_suffix(&stem(video), "_shifts.csv"), t);

@@ -420,7 +420,11 @@ impl App {
         let mut changed = false;
         ui.horizontal(|ui| {
             ui.label(RichText::new(format!("{} runs, repairing {nr} ({nf} frames)", an.runs.len())).strong());
-            if ui.small_button("All").clicked() {
+            if ui
+                .small_button("All")
+                .on_hover_text("Ticks every run, also the ones the analysis judged not to be slips. Repairing a run that is not a slip cuts an intact picture in two - check those runs in the preview first.")
+                .clicked()
+            {
                 for i in 0..an.runs.len() {
                     an.set_repair(i, true);
                 }
@@ -509,6 +513,11 @@ impl App {
         let auto = an.auto_adjust[frame];
         let base = an.base_shift(ri, frame);
         let refined = an.refined;
+        let (rs, re) = (an.runs[ri].start, an.runs[ri].end);
+        let kept = (rs..re).filter(|&k| an.keep[k]).count();
+        let gated = !an.auto_repair[ri];
+        let kept = if gated { kept } else { 0 };
+        let this_kept = gated && an.keep[frame] && !an.edits[ri].frame_offsets.contains_key(&frame) && !an.edits[ri].no_gate;
         let final_shift = an.shift(ri, frame);
         let edit_file = an.edit_file().file_name().unwrap_or_default().to_string_lossy().into_owned();
         let mut set_prev = false;
@@ -594,6 +603,16 @@ impl App {
                 });
                 ui.end_row();
             }
+            ui.label("Classifier check").on_hover_text("In a run you ticked although the analysis judged it not a slip, frames that the classifier judges clearly normal are left as they are, so that an intact picture is not cut. Untick to repair every frame.");
+            ui.horizontal(|ui| {
+                let mut gate = !e.no_gate;
+                if ui.checkbox(&mut gate, "leave normal frames").changed() {
+                    e.no_gate = !gate;
+                    changed = true;
+                }
+                ui.label(RichText::new(format!("{kept} frames left, this frame {}", if this_kept { "left as is" } else { "repaired" })).small().color(Color32::GRAY));
+            });
+            ui.end_row();
             ui.label("Tracked shift");
             ui.label(RichText::new(format!("{base} px, final {final_shift} px")).color(Color32::GRAY));
             ui.end_row();
