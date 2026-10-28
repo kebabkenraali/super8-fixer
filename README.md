@@ -4,6 +4,9 @@ Repairs **frame-line slips** (framing errors) in digitized Super 8, 8 mm and oth
 **removes dust and dirt** and **restores faded colours**. A native Windows application with a graphical
 interface and a command line. Everything runs on your own computer.
 
+**[Download Super8 Fixer 1.2.0 for Windows](https://github.com/kebabkenraali/super8-fixer/releases/latest)**
+(64-bit zip, about 23 MB) · [all releases](https://github.com/kebabkenraali/super8-fixer/releases)
+
 When film slips in the scanner gate, the frame line (the dark gap between two film frames) slides
 into the picture: the top of the video frame shows the bottom of one film frame and the bottom shows
 the top of the next. Super8 Fixer finds these places, shifts every slipped frame back into position
@@ -14,6 +17,15 @@ and rebuilds the missing part from the neighbouring frames, so that the seam doe
 *The run table, a slipped frame before and after the repair (with dust removal and colour restoration), and the run editor. The video is an emulated slip made from a Prelinger Archives home movie (CC BY 3.0).*
 
 Made with Claude AI
+
+## What's new in 1.2.0
+
+- The slip classifier also recognises slips close to the picture edge and slips with a thin or light
+  frame line that shows only as a seam, with fewer false alarms on slip-free films.
+- The classifier decides runs with the frame line at 5-95 % of the picture height (was 12-88 %).
+- Stricter dust and dirt removal: no smears on moving or blurred pictures.
+- In runs you tick yourself, frames the classifier sees as clearly normal are not cut.
+- Since 1.1: dust and dirt removal, colour restoration, side-by-side clips; stabilization was removed.
 
 ## Features
 
@@ -51,7 +63,8 @@ Made with Claude AI
 
 Requirements: Windows 10 or 11 (64-bit). A DirectX 12 GPU speeds up the classifier but is not required.
 
-1. Download `Super8Fixer-<version>-win64.zip` from the Releases page and extract it.
+1. Download `Super8Fixer-<version>-win64.zip` from the
+   [Releases page](https://github.com/kebabkenraali/super8-fixer/releases/latest) and extract it.
 2. Get ffmpeg: run `get-ffmpeg.cmd` in the folder, or copy `ffmpeg.exe` and `ffprobe.exe` into
    `Super8Fixer\ffmpeg\bin\` yourself (any recent build with libx264, for example from
    <https://github.com/BtbN/FFmpeg-Builds/releases> or <https://www.gyan.dev/ffmpeg/builds/>).
