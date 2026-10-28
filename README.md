@@ -12,9 +12,11 @@ into the picture: the top of the video frame shows the bottom of one film frame 
 the top of the next. Super8 Fixer finds these places, shifts every slipped frame back into position
 and rebuilds the missing part from the neighbouring frames, so that the seam does not show.
 
-![Super8 Fixer: a slipped frame before and after the repair](assets/screenshot.png)
+![Slipped frames before and after the repair](assets/before_after.png)
 
-*The run table, a slipped frame before and after the repair (with dust removal and colour restoration), and the run editor. The video is an emulated slip made from a Prelinger Archives home movie (CC BY 3.0).*
+*Left: the film slipped in the scanner gate, so the top of the video frame shows the bottom of one film
+frame and the bottom shows the top of the next. Right: the same frame repaired by Super8 Fixer - one
+whole film frame again. Emulated slips made from public-domain films of the Prelinger Archives.*
 
 Made with Claude AI
 
@@ -91,6 +93,11 @@ Requirements: Windows 10 or 11 (64-bit). A DirectX 12 GPU speeds up the classifi
 
    Audio is copied from the original as it is. `video.s8analysis.bin` is a cache that makes a new
    analysis of the same video fast; it can be deleted.
+
+![The Super8 Fixer window](assets/screenshot.png)
+
+*The window: run table, before/after preview with the seam marked, and the run editor for manual
+corrections (emulated slip made from a Prelinger Archives home movie, CC BY 3.0).*
 
 ## Command line
 
