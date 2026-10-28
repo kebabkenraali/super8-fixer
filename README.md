@@ -13,6 +13,8 @@ and rebuilds the missing part from the neighbouring frames, so that the seam doe
 
 *The run table, a slipped frame before and after the repair, and the run editor. The video is an emulated slip made from a Prelinger Archives home movie (CC BY 3.0).*
 
+Made with Claude AI
+
 ## Features
 
 - **Detection**: the frame line is tracked through the whole film (per-row features + Viterbi
