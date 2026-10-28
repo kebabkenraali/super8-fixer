@@ -1,0 +1,446 @@
+//! Repair pipeline: analysis -> classifier -> decisions -> seam refinement -> user edits -> report
+//! -> rendering.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+
+use crate::analysis::{self, AH, Run};
+use crate::assemble::{self, Fill, FrameJob, NEIGHBOURS, Size};
+use crate::model::{self, Classifier};
+use crate::video::{Reader, VideoInfo, Writer, parse_range};
+
+#[derive(Clone, Debug)]
+pub struct RepairSettings {
+    /// confidence needed to repair a run (when the classifier does not decide)
+    pub threshold: f32,
+    pub use_model: bool,
+    pub model_threshold: f32,
+    /// time ranges "03:37-03:44": never repair / always repair
+    pub skip: Vec<String>,
+    pub force: Vec<String>,
+    /// rebuild the frame from neighbours (otherwise only roll)
+    pub assemble: bool,
+    /// automatic seam refinement against neighbouring frames
+    pub refine: bool,
+    pub crf: u32,
+    pub preset: String,
+    pub gpu: bool,
+}
+
+impl Default for RepairSettings {
+    fn default() -> Self {
+        RepairSettings {
+            threshold: 0.45,
+            use_model: true,
+            model_threshold: 0.5,
+            skip: vec![],
+            force: vec![],
+            assemble: true,
+            refine: false,
+            crf: 16,
+            preset: "medium".into(),
+            gpu: true,
+        }
+    }
+}
+
+/// The user's changes to one run. Saved next to the video (<video>.s8edits.json) so that they
+/// survive a new analysis.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct RunEdit {
+    pub start: usize,
+    pub end: usize,
+    /// None = automatic decision
+    pub repair: Option<bool>,
+    /// seam position correction for the whole run (video rows, + moves the picture down)
+    pub offset: i64,
+    /// additional correction for single frames (video rows)
+    pub frame_offsets: BTreeMap<usize, i64>,
+    /// where the missing part of the frame is taken from
+    pub fill: Fill,
+    /// alignment correction of the filled part (video pixels)
+    pub nudge_y: i64,
+    pub nudge_x: i64,
+    /// ignore the automatic seam refinement in this run
+    pub no_refine: bool,
+}
+
+impl RunEdit {
+    fn for_run(r: &Run) -> RunEdit {
+        RunEdit { start: r.start, end: r.end, ..Default::default() }
+    }
+    pub fn is_default(&self) -> bool {
+        let d = RunEdit { start: self.start, end: self.end, ..Default::default() };
+        *self == d
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct EditFile {
+    app: String,
+    runs: Vec<RunEdit>,
+}
+
+/// Analysis result; runs and edits can be changed before rendering.
+#[derive(Clone)]
+pub struct Analysis {
+    pub info: VideoInfo,
+    pub path: Vec<i32>,
+    pub runs: Vec<Run>,
+    /// normal frame-line position (analysis rows) for every run
+    pub reference: Vec<i32>,
+    /// automatic seam refinement per frame (video rows)
+    pub auto_adjust: Vec<i64>,
+    pub edits: Vec<RunEdit>,
+    /// repair decision of the analysis itself, before the user's changes
+    pub auto_repair: Vec<bool>,
+    /// the automatic seam refinement was run
+    pub refined: bool,
+}
+
+impl Analysis {
+    /// Tracked shift (video rows) of frame `k` in run `ri`, before refinement and edits.
+    pub fn base_shift(&self, ri: usize, k: usize) -> i64 {
+        let s = (self.reference[ri] - self.path[k]).rem_euclid(AH as i32);
+        analysis::rows_to_px(s, self.info.h)
+    }
+
+    /// Final shift (video rows, 0..h) of frame `k` in run `ri`.
+    pub fn shift(&self, ri: usize, k: usize) -> usize {
+        let e = &self.edits[ri];
+        let mut s = self.base_shift(ri, k) + e.offset + e.frame_offsets.get(&k).copied().unwrap_or(0);
+        if !e.no_refine {
+            s += self.auto_adjust[k];
+        }
+        s.rem_euclid(self.info.h as i64) as usize
+    }
+
+    /// Sets the frame offsets of frames `from..to` of run `ri` so that their final shift is `target`.
+    pub fn set_shift(&mut self, ri: usize, from: usize, to: usize, target: i64) {
+        let h = self.info.h as i64;
+        for k in from..to {
+            self.edits[ri].frame_offsets.remove(&k);
+            let now = self.shift(ri, k) as i64;
+            let mut d = (target - now).rem_euclid(h);
+            if d > h / 2 {
+                d -= h;
+            }
+            if d != 0 {
+                self.edits[ri].frame_offsets.insert(k, d);
+            }
+        }
+    }
+
+    /// Shift that puts a frame line seen at `row` of frame `k` where the normal frames have it.
+    pub fn shift_for_line(&self, ri: usize, row: usize) -> i64 {
+        let h = self.info.h as i64;
+        // the tracked frame line of a frame maps to the reference position: shift = reference - line
+        (analysis::rows_to_px(self.reference[ri], self.info.h) - row as i64).rem_euclid(h)
+    }
+
+    /// What to do with every frame under the current decisions and edits.
+    pub fn jobs(&self, assemble: bool) -> Vec<FrameJob> {
+        let mut j = vec![FrameJob::default(); self.path.len()];
+        for (ri, r) in self.runs.iter().enumerate() {
+            if !r.repair {
+                continue;
+            }
+            let e = &self.edits[ri];
+            for k in r.start..r.end {
+                j[k] = FrameJob {
+                    shift: self.shift(ri, k),
+                    fill: if assemble { e.fill } else { Fill::RollOnly },
+                    nudge: (e.nudge_y, e.nudge_x),
+                };
+            }
+        }
+        j
+    }
+
+    pub fn repaired_count(&self) -> (usize, usize) {
+        let r: Vec<&Run> = self.runs.iter().filter(|r| r.repair).collect();
+        (r.len(), r.iter().map(|r| r.end - r.start).sum())
+    }
+
+    /// Sets the user's repair decision of run `ri`.
+    pub fn set_repair(&mut self, ri: usize, repair: bool) {
+        self.runs[ri].repair = repair;
+        self.runs[ri].manual = repair != self.auto_repair[ri];
+        self.edits[ri].repair = if repair == self.auto_repair[ri] { None } else { Some(repair) };
+    }
+
+    pub fn edit_file(&self) -> PathBuf {
+        Path::new(&self.info.path).with_extension("s8edits.json")
+    }
+
+    /// Saves the non-default edits next to the video (removes the file when there are none).
+    pub fn save_edits(&self) -> Result<()> {
+        let runs: Vec<RunEdit> = self.edits.iter().filter(|e| !e.is_default()).cloned().collect();
+        let p = self.edit_file();
+        if runs.is_empty() {
+            let _ = std::fs::remove_file(&p);
+            return Ok(());
+        }
+        let f = EditFile { app: format!("Super8 Fixer {}", env!("CARGO_PKG_VERSION")), runs };
+        std::fs::write(&p, serde_json::to_string_pretty(&f)?)?;
+        Ok(())
+    }
+
+    /// Applies saved edits to the runs they overlap most (at least half of either run).
+    fn load_edits(&mut self) {
+        let Ok(t) = std::fs::read_to_string(self.edit_file()) else { return };
+        let Ok(f) = serde_json::from_str::<EditFile>(&t) else {
+            crate::log("The edit file could not be read; it is ignored.");
+            return;
+        };
+        let mut used = 0;
+        for saved in f.runs {
+            let best = self
+                .runs
+                .iter()
+                .enumerate()
+                .map(|(i, r)| (i, saved.end.min(r.end).saturating_sub(saved.start.max(r.start))))
+                .max_by_key(|&(_, o)| o);
+            let Some((i, o)) = best else { continue };
+            let r = &self.runs[i];
+            if o * 2 < (r.end - r.start).min(saved.end - saved.start).max(1) {
+                continue;
+            }
+            let mut e = saved.clone();
+            e.start = r.start;
+            e.end = r.end;
+            e.frame_offsets.retain(|k, _| (r.start..r.end).contains(k));
+            if let Some(rep) = e.repair {
+                self.runs[i].repair = rep;
+                self.runs[i].manual = rep != self.auto_repair[i];
+            }
+            self.edits[i] = e;
+            used += 1;
+        }
+        if used > 0 {
+            crate::log(&format!("Applied the saved edits of {used} runs: {}", self.edit_file().display()));
+        }
+    }
+}
+
+pub fn stem(video: &str) -> PathBuf {
+    let p = Path::new(video);
+    p.with_file_name(p.file_stem().unwrap_or_default())
+}
+
+pub fn with_suffix(stem: &Path, suffix: &str) -> String {
+    format!("{}{suffix}", stem.display())
+}
+
+/// Reads downscaled frames (MH x MW RGB) at the given indices in one pass.
+pub fn read_small(v: &VideoInfo, indices: &BTreeSet<usize>) -> Result<HashMap<usize, Vec<u8>>> {
+    let mut out = HashMap::new();
+    let Some(&last) = indices.iter().next_back() else {
+        return Ok(out);
+    };
+    let filter = format!("scale={}:{}:flags=area", model::MW, model::MH);
+    let mut r = Reader::new(&v.path, Some(&filter), "rgb24", model::MW * model::MH * 3, None, Some(last + 1))?;
+    let mut i = 0;
+    while let Some(b) = r.next_frame() {
+        if indices.contains(&i) {
+            out.insert(i, b);
+        }
+        i += 1;
+        if i % 2000 == 0 {
+            crate::check_stop()?;
+            crate::progress(&format!("Frames for the classifier: {i} / {}", last + 1), i, last + 1);
+        }
+        if i > last {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+pub fn analyze(video: &str, a: &RepairSettings) -> Result<Analysis> {
+    let v = VideoInfo::read(video)?;
+    crate::log(&format!(
+        "Video: {}x{}, {:.3} fps, {:.1} min, audio: {}",
+        v.w,
+        v.h,
+        v.fps,
+        v.duration / 60.0,
+        if v.audio { "yes" } else { "no" }
+    ));
+    let s = analysis::analyze(&v)?;
+    crate::log("Tracking the frame line...");
+    let path = analysis::track(&s);
+    let ranges = |x: &[String]| -> Result<Vec<(usize, usize)>> { x.iter().map(|r| parse_range(r, v.fps)).collect() };
+    let (skip, force) = (ranges(&a.skip)?, ranges(&a.force)?);
+    let none = HashMap::new();
+    let preliminary = analysis::decide(&s, &path, a.threshold, &skip, &force, &none, a.model_threshold);
+    let mut model_p = HashMap::new();
+    if a.use_model {
+        if !model::model_path(model::MODEL_FILE).is_file() && !model::model_path(model::PERSONAL_FILE).is_file() {
+            crate::log(&format!("(Classifier models\\{} not found: using the confidence value only)", model::MODEL_FILE));
+        } else {
+            let samples = analysis::model_samples(&path, &preliminary.runs);
+            let need: BTreeSet<usize> = samples.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+            if !need.is_empty() {
+                let mut c = Classifier::load(a.gpu)?;
+                let frames = read_small(&v, &need)?;
+                for (key, idx) in samples {
+                    let k: Vec<Vec<u8>> = idx.iter().filter_map(|i| frames.get(i).cloned()).collect();
+                    if k.is_empty() {
+                        continue;
+                    }
+                    let p = c.predict(&k)?;
+                    let mean = p.iter().map(|&x| x as f64).sum::<f64>() as f32 / p.len() as f32;
+                    model_p.insert(key, c.calibrate(mean));
+                }
+            }
+        }
+    }
+    let d = analysis::decide(&s, &path, a.threshold, &skip, &force, &model_p, a.model_threshold);
+    let n = path.len();
+    let auto_repair = d.runs.iter().map(|r| r.repair).collect();
+    let edits = d.runs.iter().map(RunEdit::for_run).collect();
+    let mut an = Analysis { info: v, path, runs: d.runs, reference: d.reference, auto_adjust: vec![0; n], edits, auto_repair, refined: a.refine };
+    if a.refine && !an.runs.is_empty() {
+        crate::log("Refining the seam positions against neighbouring frames...");
+        let jobs: Vec<(usize, usize, Vec<usize>)> = an
+            .runs
+            .iter()
+            .enumerate()
+            .map(|(ri, r)| (r.start, r.end, (r.start..r.end).map(|k| an.base_shift(ri, k).rem_euclid(an.info.h as i64) as usize).collect()))
+            .collect();
+        let adj = crate::refine::refine(&an.info, &jobs)?;
+        let mut changed = 0;
+        for (r, a) in an.runs.iter().zip(adj) {
+            for (k, d) in (r.start..r.end).zip(a) {
+                an.auto_adjust[k] = d;
+                changed += usize::from(d != 0);
+            }
+        }
+        crate::log(&format!("Seam refinement changed {changed} frames."));
+        // development aid: SUPER8FIXER_DUMP=1 writes the tracked and refined shift of every run frame
+        if std::env::var_os("SUPER8FIXER_DUMP").is_some() {
+            let mut t = String::from("frame,base,adjust\n");
+            for (ri, r) in an.runs.iter().enumerate() {
+                for k in r.start..r.end {
+                    t += &format!("{k},{},{}\n", an.base_shift(ri, k).rem_euclid(an.info.h as i64), an.auto_adjust[k]);
+                }
+            }
+            let _ = std::fs::write(with_suffix(&stem(video), "_shifts.csv"), t);
+        }
+    }
+    an.load_edits();
+    let (nr, nf) = an.repaired_count();
+    let rep = with_suffix(&stem(video), "_repair_report.txt");
+    analysis::report(Path::new(&rep), &an.runs, an.info.fps)?;
+    crate::log(&format!("Found {} runs where the frame line is away from the edge; repairing {nr} runs ({nf} frames). Report: {rep}", an.runs.len()));
+    Ok(an)
+}
+
+pub struct Preview {
+    pub original: Vec<u8>,
+    pub repaired: Vec<u8>,
+    /// row of the frame line in the original, and of the seam in the repaired frame (None = not repaired)
+    pub seam: Option<(usize, usize)>,
+}
+
+/// One repaired frame for the preview, at full size.
+pub fn preview(an: &Analysis, i: usize, assemble: bool) -> Result<Preview> {
+    let v = &an.info;
+    let start = i.saturating_sub(NEIGHBOURS);
+    let size = v.w * v.h * 3;
+    let mut r = Reader::new(&v.path, None, "rgb24", size, Some(start as f64 / v.fps), Some(2 * NEIGHBOURS + 1))?;
+    let mut frames: Vec<Option<Vec<u8>>> = vec![None; NEIGHBOURS - (i - start)];
+    while let Some(b) = r.next_frame() {
+        frames.push(Some(b));
+    }
+    while frames.len() < 2 * NEIGHBOURS + 1 {
+        frames.push(None);
+    }
+    let original = frames[NEIGHBOURS].clone().ok_or_else(|| anyhow::anyhow!("frame {i} could not be read"))?;
+    let jobs = an.jobs(assemble);
+    let repaired = assemble::repair_batch(&frames, i, 1, Size { w: v.w, h: v.h }, &jobs).into_iter().next().unwrap();
+    let s = jobs.get(i).map(|j| j.shift).unwrap_or(0);
+    let seam = (s != 0).then(|| ((v.h - s) % v.h, s));
+    Ok(Preview { original, repaired, seam })
+}
+
+/// Before/after page with the middle frame of every repaired run.
+pub fn before_after(an: &Analysis, path: &str, assemble: bool) -> Result<()> {
+    let v = &an.info;
+    let rows: Vec<&Run> = an.runs.iter().filter(|r| r.repair).collect();
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let (tw, th) = (360u32, (360 * v.h / v.w) as u32);
+    let mut page = image::RgbImage::from_pixel(tw * 2 + 10, (th + 4) * rows.len() as u32, image::Rgb([40, 40, 40]));
+    for (n, r) in rows.iter().enumerate() {
+        crate::check_stop()?;
+        let i = (r.start + r.end) / 2;
+        let p = preview(an, i, assemble)?;
+        for (x0, img) in [(0u32, p.original), (tw + 10, p.repaired)] {
+            let im = image::RgbImage::from_raw(v.w as u32, v.h as u32, img).unwrap();
+            let mut small = image::imageops::resize(&im, tw, th, image::imageops::FilterType::Triangle);
+            crate::font::draw(&mut small, 4, 4, &format!("{} #{i}", crate::video::timestamp(i, v.fps)), [255, 255, 0]);
+            image::imageops::replace(&mut page, &small, x0 as i64, (n as u32 * (th + 4)) as i64);
+        }
+        crate::progress(&format!("Before/after images: {} / {}", n + 1, rows.len()), n + 1, rows.len());
+    }
+    page.save(path)?;
+    Ok(())
+}
+
+/// Renders the repaired video.
+pub fn render(an: &Analysis, a: &RepairSettings, out: &str) -> Result<usize> {
+    let v = &an.info;
+    let jobs = an.jobs(a.assemble);
+    let k = Size { w: v.w, h: v.h };
+    let size = v.w * v.h * 3;
+    let mut r = Reader::new(&v.path, None, "rgb24", size, None, None)?;
+    let mut w = Writer::new(out, v, a.crf, &a.preset, v.audio.then_some(v.path.as_str()))?;
+    const BATCH: usize = 24;
+    // window[0] = frame `start - NEIGHBOURS`
+    let mut window: Vec<Option<Vec<u8>>> = vec![None; NEIGHBOURS];
+    let mut start = 0usize;
+    let mut ended = false;
+    loop {
+        crate::check_stop()?;
+        while !ended && window.len() < NEIGHBOURS + BATCH + NEIGHBOURS {
+            match r.next_frame() {
+                Some(b) => window.push(Some(b)),
+                None => ended = true,
+            }
+        }
+        let available = window.len().saturating_sub(NEIGHBOURS);
+        let count = if ended { available } else { available.saturating_sub(NEIGHBOURS).min(BATCH) };
+        if count == 0 {
+            break;
+        }
+        if jobs[start.min(jobs.len())..(start + count).min(jobs.len())].iter().all(|j| j.shift == 0) {
+            for d in 0..count {
+                w.write(window[NEIGHBOURS + d].as_ref().unwrap())?;
+            }
+        } else {
+            // at the end of the video there are no frames in the neighbour slots
+            while window.len() < NEIGHBOURS + count + NEIGHBOURS {
+                window.push(None);
+            }
+            for f in assemble::repair_batch(&window, start, count, k, &jobs) {
+                w.write(&f)?;
+            }
+        }
+        start += count;
+        crate::progress(&format!("Rendering the repaired video: {start} / {} frames", v.n), start, v.n.max(start));
+        if ended {
+            break;
+        }
+        window.drain(..count);
+    }
+    w.finish()?;
+    crate::log(&format!("Done: {out} ({start} frames)"));
+    Ok(start)
+}
